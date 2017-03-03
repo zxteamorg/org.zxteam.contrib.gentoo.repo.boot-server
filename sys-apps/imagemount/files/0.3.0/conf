@@ -1,0 +1,3 @@
+# imagemount configuration file for /etc/init.d/imagemount
+
+#IMAGE_FILES_FIND_PATTERNS="/img/disk-*.iso"

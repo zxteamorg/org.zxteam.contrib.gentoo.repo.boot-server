@@ -1,0 +1,83 @@
+#!/bin/bash
+
+SCRIPT_NAME=$(basename $(readlink -f $0))
+SCRIPT_DIR=$(dirname $(readlink -f $0))
+
+function cleanup() {
+	echo "Cleanup..."
+
+	[ -n "$PID" ] && kill $PID 2> /dev/null
+	
+	echo "Kill all children of PID: $$"
+	pkill -TERM -P $$
+	exit 1
+}
+trap cleanup EXIT
+
+function usage {
+    echo "This script moves snapshot from remote host to local host."
+    echo "$SCRIPT_NAME [--do-not-remove-snapshot] <RemoteUse@RemoteHost> <Remote host logical volume device> <Destination local directory>"
+}
+
+function error_args {
+	echo "ERROR! Bad arguments" >&2
+	exit 1
+}
+
+REMOTE_HOST="$1"
+REMOTE_LV_DEV="$2"
+DEST_DIR="$3"
+
+function _ssh {
+	ssh "${REMOTE_HOST}" "$1"
+	if ! ssh "${REMOTE_HOST}" "$1"; then
+		echo "Cannot execute command \"$1\" on remote host ${REMOTE_HOST}" >&2
+		exit 1
+	fi
+}
+
+
+REMOTE_CMD="ls $REMOTE_LV_DEV-* | grep -E \"$REMOTE_LV_DEV-[0-9]{14}$\" | sort -t - -k 3 -g"
+SNAPSHOT_DEVS=`_ssh "$REMOTE_CMD"`
+if [ -z "$SNAPSHOT_DEVS" ]; then
+	echo "Snapshots were not found on remote host."
+	exit 1
+else
+	for SNAPSHOT_DEV in $SNAPSHOT_DEVS; do
+		echo "Retreive snapshot: $SNAPSHOT_DEV"
+		IMG_FILE=`echo $SNAPSHOT_DEV | grep -oE "[0-9]{14}$"`
+		if [ -z "$IMG_FILE" ]; then
+			echo "Cannot resolve destination file." >&2
+			exit 100;
+		fi
+
+		while true; do sleep 60; echo "Progress: $(ls -lh ${IMG_FILE}.img.tmp | awk '{ print $5 }')"; done 2> /dev/null &
+		PID=$!
+
+		REMOTE_CMD="dd if=\"$SNAPSHOT_DEV\" 2> /dev/null | gzip -3 -"
+		_ssh "$REMOTE_CMD" | gunzip -c | dd of="${IMG_FILE}.img.tmp"
+		kill $PID 2> /dev/null
+		wait $PID 2> /dev/null
+
+		sleep 3
+
+		echo "Calculate remote snaphot $SNAPSHOT_DEV SHA1 sum"
+		REMOTE_CMD="dd if=\"$SNAPSHOT_DEV\" 2> /dev/null | sha1sum -b | awk '{ print \$1 }'"
+		REMOTE_SNAP_SHA1=`ssh "${REMOTE_HOST}" "$REMOTE_CMD"`
+		echo "Calculate retrived snaphot ${IMG_FILE}.img.tmp SHA1 sum"
+		IMG_FILE_SHA1=`dd if="${IMG_FILE}.img.tmp" 2> /dev/null | sha1sum -b | awk '{ print \$1 }'`
+		if [ "$REMOTE_SNAP_SHA1" != "$IMG_FILE_SHA1" ]; then
+			echo "Retrived snapshot checksum not equals" >&2
+			exit 1
+		fi
+
+		echo "Snapshot copy has correct SHA1 sum $IMG_FILE_SHA1"
+		mv "${IMG_FILE}.img.tmp" "${DEST_DIR}/${IMG_FILE}.img"
+
+		echo "Delete remote snapshot $SNAPSHOT_DEV"
+		REMOTE_CMD="lvremove -f \"$SNAPSHOT_DEV\""
+		_ssh "$REMOTE_CMD"
+
+		echo
+	done
+fi

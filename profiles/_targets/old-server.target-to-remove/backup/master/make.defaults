@@ -1,0 +1,1 @@
+APACHE2_MODULES="${APACHE2_MODULES} proxy proxy_http"

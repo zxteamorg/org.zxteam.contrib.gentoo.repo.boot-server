@@ -1,0 +1,26 @@
+# /etc/conf.d/virtualbox Configuration file for /etc/init.d/virtualbox
+
+
+# Username to start vbox as, must be part of vboxusers group.
+#VM_USER="nobody"
+
+# Virtual Machine Name
+#VM_NAME="vbox1"
+
+# Shutdown Method: pause|resume|reset|poweroff|savestate|acpipowerbutton|acpisleepbutton
+#VM_SHUTDOWN="acpipowerbutton"
+
+# Nice Priority: -20 (most favorable scheduling) to 19 (least favorable)
+#VM_NICE=0
+
+# To send Ctrl-Alt-Del to the VM
+#VM_SHUTDOWN="keyboardputscancode 1d 38 53"
+
+
+#VM_VNC_PORT=6000
+
+#VM_VNC_PASSWORD=123
+
+
+# The name of snapshot that should be restored at startup time
+#VM_STARTUP_REVERT_SNAPSHOT="MainSnapshot"

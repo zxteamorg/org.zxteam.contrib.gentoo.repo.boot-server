@@ -1,0 +1,115 @@
+#!/sbin/runscript
+
+INSTANCE=${SVCNAME#*.}
+
+start()
+{
+	einfo "Starting ${SVCNAME}"
+
+	if [ -z "$LV_DEV" ]; then
+		eerror "Configuration error: LV_DEV is not defined"
+		return 1
+	fi
+	if [ ! -b "$LV_DEV" ]; then
+		eerror "Configuration error: LV_DEV=$LV_DEV is not exist"
+		return 1
+	fi
+
+	if [ -z "$LV_SIZE_ARG" ]; then
+		eerror "Configuration error: LV_SIZE_ARG is not defined"
+		return 1
+	fi
+	case "$LV_SIZE_ARG" in
+		-l* | -L*)
+			;;
+		*)
+			eerror "Configuration error: LV_SIZE_ARG=$LV_SIZE_ARG is not valid. Example: -L80M or -l80%FREE"
+			return 1
+			;;
+	esac
+
+	if [ -n "$RETURN_LEVEL" ]; then
+		case "$RETURN_LEVEL" in
+			3|4|5)
+				;;
+			*)
+				eerror "Configuration error: RETURN_LEVEL=$RETURN_LEVEL must be in 3, 4, 5"
+				return 1
+				;;
+		esac
+	fi
+
+	if [ -n "$MAX_SNAPSHOTS" ]; then
+		MAX_SNAPSHOTS=$(($MAX_SNAPSHOTS+0))
+		if [ $MAX_SNAPSHOTS -lt 1 ]; then
+			eerror "Configuration error: MAX_SNAPSHOT=$MAX_SNAPSHOTS must be ge 1"
+			return 1
+		fi
+	fi
+
+	if [ -n "$MOUNT_RO_DEV" ]; then
+		if [ ! -b "$MOUNT_RO_DEV" ]; then
+			eerror "Configuration error: MOUNT_RO_DEV $MOUNT_RO_DEV is not exist"
+			return 1
+		fi
+	fi
+
+
+	if [ -n "$MAX_SNAPSHOTS" ]; then
+		CURRENT_SNAPSHOTS=$(ls /dev/vg0/crypt-root-* | grep -E 'crypt-root-[0-9]{14}$' | sort -t - -k 3 -g)
+		COUNT=$(echo "$CURRENT_SNAPSHOTS" | wc -l)
+		if [ $COUNT -ge $MAX_SNAPSHOTS ]; then
+			einfo "Maximum snapshot count is achieved."
+			OLDEST_SNAPSHOT=$(echo "$CURRENT_SNAPSHOTS" | head -n 1)
+			OLDEST_SNAPSHOT_ATTRS=$(echo "$OLDEST_SNAPSHOT" | lvs --noheadings --options attr | sed 's/^ *//' | grep -E '^s')
+			if [ -n "$OLDEST_SNAPSHOT_ATTRS" ]; then
+				einfo "Remove oldest snapshot \"$OLDEST_SNAPSHOT\""
+				lvremove -f "$OLDEST_SNAPSHOT"
+			else
+				ewarn "Found $OLDEST_SNAPSHOT but this is not snapshot"
+			fi
+		fi
+	fi
+
+	local TIMESTAMP
+	local SNAPNAME
+	local err=0
+	local was_remount=0
+
+	TIMESTAMP=$(date +%Y%m%d%H%M%S)
+	SNAPNAME=$(/sbin/lvdisplay "$LV_DEV" 2>/dev/null)
+	if [ $? -ne 0 ]; then
+		eerror "Cannot determinate snapshot name"
+		return 1
+	fi
+	SNAPNAME=$(echo "$SNAPNAME" | grep "LV Name" | awk '{print $3}')-$TIMESTAMP
+
+	if [ -n "$MOUNT_RO_DEV" ]; then
+		if mount -n -o remount,ro "$MOUNT_RO_DEV"; then
+			was_remount=1
+			einfo "Device $MOUNT_RO_DEV was remount as read-only: "`cat /proc/mounts | grep "$MOUNT_RO_DEV" | awk '{print $4}'`
+		else
+			eerror "Cannot remount as read-only"
+			err=1
+		fi
+	fi
+
+	if [ "$err" == "0" ]; then
+		if ! /sbin/lvcreate -An --permission r "$LV_SIZE_ARG" --snapshot --name "$SNAPNAME" "$LV_DEV" 2>/dev/null; then
+			eerror "Cannot create snapshot \"$SNAPNAME\" from device \"$LV_DEV\""
+			err=1
+		fi
+	fi
+
+	if [ "$was_remount" != "0" ]; then
+		mount -o remount,rw "$MOUNT_RO_DEV"
+		einfo "Device $MOUNT_RO_DEV was remount as read-write: "`cat /proc/mounts | grep "$MOUNT_RO_DEV" | awk '{print $4}'`
+	fi
+
+	if [ -n "$RETURN_LEVEL" ]; then
+		sleep 5 && telinit "$RETURN_LEVEL" &
+		einfo "Swith to runlevel $RETURN_LEVEL in few seconds."
+	fi
+
+	return $err
+}

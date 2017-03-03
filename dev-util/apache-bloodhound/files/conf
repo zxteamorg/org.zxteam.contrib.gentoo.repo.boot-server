@@ -1,0 +1,38 @@
+# Config file for /etc/init.d/hudson
+
+#
+# Directory where Hudson store its configuration and working
+# files (checkouts, build reports, artifacts, ...).
+#
+#home="/var/lib/hudson/home"
+
+# Backup directory
+#backup="/var/lib/hudson/backup"
+
+# Run as user
+#user="hudson"
+
+# PID file
+#pidfile="/run/hudson.pid"
+
+# Log file
+#logfile="/var/log/hudson.log"
+
+#
+# Options to pass to java when running Hudson.
+#
+#java_opts="-Djava.awt.headless=true -Dmail.smtp.starttls.enable=true"
+
+#
+# Port Hudson is listening on.
+#
+#port="8080"
+
+
+#
+# Pass arbitrary arguments to Hudson.
+# Eg.: --httpListenAddress=127.0.0.1 --prefix=/hudson
+# Full option list: java -jar hudson.war --help
+#
+#args=""
+

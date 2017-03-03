@@ -1,0 +1,18 @@
+# required by media-tv/kodi-14.1
+# required by @system
+# required by @world (argument)
+=media-fonts/roboto-2015.03 ~arm
+# required by kodi (argument)
+=media-tv/kodi-14.1 **
+# required by media-tv/kodi-14.1
+# required by @system
+# required by @world (argument)
+=media-video/ffmpeg-2.6.1 ~arm
+# required by media-tv/kodi-14.1[projectm]
+# required by @system
+# required by @world (argument)
+=media-libs/libprojectm-2.1.0-r1 ~arm
+# required by media-tv/kodi-14.1
+# required by @system
+# required by @world (argument)
+=dev-libs/tinyxml-2.6.2-r2 ~arm

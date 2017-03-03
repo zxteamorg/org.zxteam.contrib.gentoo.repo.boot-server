@@ -1,0 +1,21 @@
+#arch		profile_directory				status
+
+# x86 Profiles
+x86	x86							stable
+x86	x86/solutions/bootserver				dev
+x86	x86/vm/guest						stable
+x86	x86/vm/guest/qemu					stable
+x86	x86/vm/host						stable
+x86	x86/vm/host/qemu					stable
+
+# amd64 Profiles
+amd64	amd64							stable
+amd64	amd64/solutions/bootserver				dev
+amd64	amd64/vm/guest						stable
+amd64	amd64/vm/guest/qemu					stable
+amd64	amd64/vm/host						stable
+amd64	amd64/vm/host/qemu					stable
+
+# arm Profiles
+arm	arm/solutions/bootserver				dev
+arm	arm/solutions/bootserver/cubietruck			dev

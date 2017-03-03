@@ -1,0 +1,924 @@
+#!/bin/bash
+
+# /* zxbackup-create-local-snapshot */
+# /* zxbackup-manager-create-remote-snapshot */
+# /* zxbackup-manager-download-remote-snapshots */
+# /* zxbackup-manager-update-delta */
+# /* */
+# /* */
+# /* */
+# /* */
+# /* */
+# /* */
+
+SCRIPT_NAME=$(basename $(readlink -f $0))
+SCRIPT_ACTION=$(basename $0)
+SCRIPT_DIR=$(dirname $(readlink -f $0))
+SCRIPT_TEMP="${HOME}/.tmp.${SCRIPT_NAME}.$$"
+
+mkdir -p "$SCRIPT_TEMP"
+if [ $? -ne 0 ]; then
+	echo "Cannot create temp directory $SCRIPT_TEMP"
+        exit 14
+fi
+
+function cleanup() {
+	[ -n "$PID" ] && kill $PID 2> /dev/null
+
+	pkill -TERM -P $$
+	
+	rm -rf "${SCRIPT_TEMP}"
+}
+trap "cleanup" EXIT
+
+function __get_file_sum {
+	if [ ! -r "$1" ]; then
+		echo "Cannot get file SHA512 sum. A file '$1' does not exist." >&2
+		return 254
+	fi
+
+        local SUM_FILE=${1}.sum
+
+	if [ ! -r "${SUM_FILE}" ]; then
+		echo "Calculate SHA512 sum of the file '$1'" >&2
+		local SUM=
+		SUM=`sha512sum -b "${1}" | awk '{ print $1 }'`
+		if [ $? -ne 0 -o -z "${SUM}" ]; then
+			echo "Cannot calculate SHA512 sum of inital snapshot ${INITAL_SNAPSHOT}" >&2
+			return 1
+		fi
+		echo -n "${SUM}"
+		if [ ! "$2" == "--do-not-save-sum" ]; then
+			echo -n "${SUM}" > "${SUM_FILE}" 2>/dev/null
+		fi
+	else
+		cat "${SUM_FILE}"
+		return $?
+	fi
+	return 0
+}
+
+
+function _create_local_snapshot {
+	if [ $# -lt 1 ]; then
+		echo "Usage:
+    $0 --volume-group=VolumeGroupName --logical-volume=LogicalVolumeName --lvm-size-arg=SnapshotLvmSizeArg \
+[--switch-init-level=NUMBER] [--max-snapshot-count=3] [--remount-ro-device=DEV] [--pre-hook-script=/path/to/pre-hook.sh] \
+[--post-hook-script=/path/to/post-hook.sh]" >&2
+		return 255
+	fi
+
+	local VG_NAME
+	local LV_NAME
+	local SNAPSHOT_LV_SIZE_ARG
+	local PARK_INIT_LEVEL
+	local MAX_SNAPSHOTS=3 # Default = 3
+	local MOUNT_RO_DEV
+	local PRE_HOOK_SCRIPT
+	local POST_HOOK_SCRIPT
+	
+	while [ "$#" -ge 1 ]; do
+		case "$1" in
+			--volume-group=*)
+				VG_NAME=`echo $1 | sed 's/[-a-zA-Z0-9]*=//'`
+				shift
+				;;
+			--logical-volume=*)
+				LV_NAME=`echo $1 | sed 's/[-a-zA-Z0-9]*=//'`
+				shift
+				;;
+			--lvm-size-arg=*)
+				SNAPSHOT_LV_SIZE_ARG=`echo $1 | sed 's/[-a-zA-Z0-9]*=//'`
+				shift
+				;;
+			--switch-init-level=*)
+				PARK_INIT_LEVEL=`echo $1 | sed 's/[-a-zA-Z0-9]*=//'`
+				shift
+				;;
+			--max-snapshot-count=*)
+				MAX_SNAPSHOTS=`echo $1 | sed 's/[-a-zA-Z0-9]*=//'`
+				shift
+				;;
+			--remount-ro-device=*)
+				MOUNT_RO_DEV=`echo $1 | sed 's/[-a-zA-Z0-9]*=//'`
+				shift
+				;;
+			--pre-hook-script=*)
+				PRE_HOOK_SCRIPT=`echo $1 | sed 's/[-a-zA-Z0-9]*=//'`
+				shift
+				;;
+			--post-hook-script=*)
+				POST_HOOK_SCRIPT=`echo $1 | sed 's/[-a-zA-Z0-9]*=//'`
+				shift
+				;;
+			*)
+				shift
+				;;
+		esac
+	done
+
+	local LV_DEV=/dev/$VG_NAME/$LV_NAME
+	if [ ! -b "$LV_DEV" ]; then
+		echo "Configuration error: Device $LV_DEV is not exist" >&2
+		return 254
+	fi
+
+	case "$SNAPSHOT_LV_SIZE_ARG" in
+		-l* | -L*)
+			;;
+		*)
+			echo "Configuration error: Snapshot size argument $SNAPSHOT_LV_SIZE_ARG is not valid. Example: -L80M or -l80%FREE" >&2
+			return 253
+			;;
+	esac
+
+	if [ -n "$PARK_INIT_LEVEL" ]; then
+		case "$PARK_INIT_LEVEL" in
+			4|5)
+				;;
+			*)
+				echo  "Configuration error: ParkInitLevel=$PARK_INIT_LEVEL must be in 4, 5" >&2
+				return 252
+				;;
+		esac
+	fi
+
+	MAX_SNAPSHOTS=$(($MAX_SNAPSHOTS+0))
+	if [ $MAX_SNAPSHOTS -lt 1 ]; then
+		echo "Configuration error: MaximumSnapshotCount=$MAX_SNAPSHOTS must be ge 1" >&2
+		return 251
+	fi
+
+	[ -z "$MOUNT_RO_DEV" ] && MOUNT_RO_DEV="$LV_DEV"
+
+	if [ -n "${PRE_HOOK_SCRIPT}" ]; then
+		if [ -x "${PRE_HOOK_SCRIPT}" ]; then
+			echo "Execute pre-hook '${PRE_HOOK_SCRIPT}'"
+    			"${PRE_HOOK_SCRIPT}" 2>&1
+			if [ $? -ne 0 ]; then
+				echo "Pre-hook script error" >&2
+				return 72
+			fi		
+		else
+		    	echo "Pre-hook script ${PRE_HOOK_SCRIPT} not found"
+		    	return 71
+		fi
+	fi
+	
+	# Arguments are OK, start work
+	local WORK_INIT_LEVEL=
+
+	if [ -n "$PARK_INIT_LEVEL" ]; then
+		WORK_INIT_LEVEL=`who -r | awk '{print $2}'`
+		if [ -z "$WORK_INIT_LEVEL" ]; then
+			echo "Cannot determinate current init level." >&2
+			return 99
+		fi
+		echo "Current init level is ${WORK_INIT_LEVEL}"
+
+		echo "Switch to parking init level $PARK_INIT_LEVEL"
+		/sbin/telinit -t 30 "${PARK_INIT_LEVEL}"
+		if [ $? -ne 0 ]; then
+			echo "Cannot switch to parking level" >&2
+			return 98
+		fi
+
+		echo "Wait 60 sec for close all processes"
+		sleep 60
+	fi
+		
+	local ERR_CODE=0
+	# remove oldest snapshots
+	CURRENT_SNAPSHOTS=$(ls ${LV_DEV}* | grep -E "${LV_NAME}-[0-9]{14}$" | sort -t - -k 3 -g)
+	COUNT=$(echo "$CURRENT_SNAPSHOTS" | wc -l)
+	while [ $COUNT -ge $MAX_SNAPSHOTS ]; do
+		echo "Maximum snapshot count is achieved."
+		local OLDEST_SNAPSHOT=$(echo "$CURRENT_SNAPSHOTS" | head -n 1)
+		local OLDEST_SNAPSHOT_ATTRS=$(echo "$OLDEST_SNAPSHOT" | lvs --noheadings --options attr | sed 's/^ *//' | grep -E '^s')
+		if [ -n "$OLDEST_SNAPSHOT_ATTRS" ]; then
+			echo "Remove oldest snapshot \"$OLDEST_SNAPSHOT\""
+			lvremove -f "$OLDEST_SNAPSHOT"
+			if [ $? -ne 0 ]; then
+				echo "Cannot remove obsolete snapshot $OLDEST_SNAPSHOT" >&2
+				ERR_CODE=94
+				break
+			fi
+		else
+			echo "Found $OLDEST_SNAPSHOT but this is not snapshot" >&2
+			break
+		fi
+
+		CURRENT_SNAPSHOTS=$(ls ${LV_DEV}* | grep -E "${LV_NAME}-[0-9]{14}$" | sort -t - -k 3 -g)
+		COUNT=$(echo "$CURRENT_SNAPSHOTS" | wc -l)
+	done
+
+	local TIMESTAMP
+	local SNAPNAME
+	local was_remount=0
+
+	TIMESTAMP=`date +%Y%m%d%H%M%S`
+	if [ $? -ne 0 ]; then
+		echo "Cannot determinate snapshot name" >&2
+		ERR_CODE=97
+	fi
+		
+	if [ "$ERR_CODE" -eq 0 ]; then
+		SNAPNAME="${LV_NAME}-${TIMESTAMP}"
+
+		if [ -n "$MOUNT_RO_DEV" ]; then
+			local REMOUNT_ATTEMPT=3
+			echo "Try to remount device $MOUNT_RO_DEV as read-only"
+			while [ "$REMOUNT_ATTEMPT" -gt 0 ]; do
+				if mount -n -o remount,ro "$MOUNT_RO_DEV"; then
+					was_remount=1
+					echo "Device $MOUNT_RO_DEV was remount as read-only"
+					break
+				else
+					echo "Remount attempt $REMOUNT_ATEMPT failure." >&2
+				fi
+				
+				let "REMOUNT_ATTEMPT=$REMOUNT_ATTEMPT-1"
+
+				# wait for close all of process
+				sleep 10
+			done
+			if [ "$was_remount" -ne 1 ]; then
+				echo "Cannot remount as read-only" >&2
+				/usr/bin/lsof | grep -e "[[:digit:]]\+w"
+				ERR_CODE=72
+			fi
+		fi
+	fi
+
+	if [ "$ERR_CODE" -eq 0 ]; then
+		if /sbin/lvcreate ${LVCREATE_ARGS:--An} --permission r "$SNAPSHOT_LV_SIZE_ARG" --snapshot --name "$SNAPNAME" "$LV_DEV"; then
+			echo "Snapshot $SNAPNAME was created successfully."
+		else
+			echo "Cannot create snapshot \"$SNAPNAME\" from device \"$LV_DEV\"" >&2
+			ERR_CODE=42
+		fi
+	fi
+
+	if [ "$was_remount" -ne 0 ]; then
+		mount -o remount,rw "$MOUNT_RO_DEV"
+		echo "Device $MOUNT_RO_DEV was remount as read-write."
+	fi
+
+	if [ -n "$PARK_INIT_LEVEL" ]; then
+		echo "Restore work init level ${WORK_INIT_LEVEL}"
+		/sbin/telinit ${WORK_INIT_LEVEL}
+	fi
+
+	if [ -n "${POST_HOOK_SCRIPT}" ]; then
+		if [ -x "${POST_HOOK_SCRIPT}" ]; then
+			echo "Execute post-hook '${POST_HOOK_SCRIPT}'"
+    			"${POST_HOOK_SCRIPT}" 2>&1
+			if [ $? -ne 0 ]; then
+				echo "Post-hook script error" >&2
+				return 73
+			fi		
+		else
+		    	echo "Post-hook script ${POST_HOOK_SCRIPT} not found"
+		fi
+	fi
+
+
+	return $ERR_CODE
+}
+
+function _create_remote_snapshot {
+	if [ $# -lt 1 ]; then
+		echo "Usage:
+    $0 [User@]RemoteHost --volume-group=VolumeGroupName --logical-volume=LogicalVolumeName --lvm-size-arg=SnapshotLvmSizeArg \
+[--switch-init-level=NUMBER] [--max-snapshot-count=3] [--remount-ro-device=DEV] [--pre-hook-script=/path/to/pre-hook.sh] \
+[--post-hook-script=/path/to/post-hook.sh]" >&2
+		return 255
+	fi
+
+	local SSH_HOST="$1"
+	shift
+	
+	local VG_NAME
+	local LV_NAME
+	local SNAPSHOT_LV_SIZE_ARG
+	local PARK_INIT_LEVEL
+	local MAX_SNAPSHOTS=3 # Default = 3
+	local REMOUNT_RO_DEV
+	local PRE_HOOK_SCRIPT
+	local POST_HOOK_SCRIPT
+	
+	while [ "$#" -ge 1 ]; do
+		case "$1" in
+			--volume-group=*)
+				VG_NAME=`echo $1 | sed 's/[-a-zA-Z0-9]*=//'`
+				shift
+				;;
+			--logical-volume=*)
+				LV_NAME=`echo $1 | sed 's/[-a-zA-Z0-9]*=//'`
+				shift
+				;;
+			--lvm-size-arg=*)
+				SNAPSHOT_LV_SIZE_ARG=`echo $1 | sed 's/[-a-zA-Z0-9]*=//'`
+				shift
+				;;
+			--switch-init-level=*)
+				PARK_INIT_LEVEL=`echo $1 | sed 's/[-a-zA-Z0-9]*=//'`
+				shift
+				;;
+			--max-snapshot-count=*)
+				MAX_SNAPSHOTS=`echo $1 | sed 's/[-a-zA-Z0-9]*=//'`
+				shift
+				;;
+			--remount-ro-device=*)
+				REMOUNT_RO_DEV=`echo $1 | sed 's/[-a-zA-Z0-9]*=//'`
+				shift
+				;;
+			--pre-hook-script=*)
+				PRE_HOOK_SCRIPT=`echo $1 | sed 's/[-a-zA-Z0-9]*=//'`
+				shift
+				;;
+			--post-hook-script=*)
+				POST_HOOK_SCRIPT=`echo $1 | sed 's/[-a-zA-Z0-9]*=//'`
+				shift
+				;;
+			*)
+				shift
+				;;
+		esac
+	done
+
+	echo "Execute in background /usr/sbin/zxbackup-create-local-snapshot on the remote host $SSH_HOST"
+	local CURRENT_PID=$$
+	ssh ${SSH_HOST} "sudo /usr/sbin/zxbackup-create-local-snapshot \"--volume-group=$VG_NAME\" \"--logical-volume=$LV_NAME\" \
+		\"--lvm-size-arg=$SNAPSHOT_LV_SIZE_ARG\" \"--switch-init-level=$PARK_INIT_LEVEL\" \"--max-snapshot-count=$MAX_SNAPSHOTS\" \
+		\"--remount-ro-device=$REMOUNT_RO_DEV\" \"--pre-hook-script=${PRE_HOOK_SCRIPT}\" \"--post-hook-script=${POST_HOOK_SCRIPT}\" \
+		>/run/zxbackup.${CURRENT_PID}.log 2>&1 & wait \$!; cat /run/zxbackup.${CURRENT_PID}.log; rm -f /run/zxbackup.${CURRENT_PID}.log"
+
+        if [ $? -ne 0 ]; then
+    		return 1
+        fi
+
+	return 0
+}
+
+function _list_remote_snapshots {
+	local SSH_HOST="$1"
+	local VG_NAME="$2"
+	local LV_NAME="$3"
+
+	if [ $# -ne 3 ]; then
+		echo "Usage:
+    $0 [User@]RemoteHost VolumeGroupName LogicalVolumeName" >&2
+		return 255
+	fi
+
+	local SSH_CMD_RESULT=
+	local DEV=
+	SSH_CMD_RESULT=`ssh -o "BatchMode yes" "${SSH_HOST}" "
+	if [ ! -b \"/dev/$VG_NAME/$LV_NAME\" ]; then 
+		echo \"Bad logical volume /dev/$VG_NAME/$LV_NAME on the host \$(hostname -f)\" >&2
+		exit 1
+	fi
+	ls \"/dev/$VG_NAME/$LV_NAME\"* | grep -E \"/dev/$VG_NAME/$LV_NAME-[0-9]{14}$\" | sort -t - -k 3 -g
+"`
+
+	if [ $? -ne 0 ]; then
+		echo "${SSH_CMD_RESULT}"
+		return 1
+	fi
+
+	echo "${SSH_CMD_RESULT}"
+	return 0
+}
+
+
+function _download_remote_snapshots {
+	if [ $# -lt 1 ]; then
+		echo "Usage:
+    $0 [User@]RemoteHost --volume-group=VolumeGroupName --logical-volume=LogicalVolumeName --snapshots-dir=SnapshotsDirectory" >&2
+		return 255
+	fi
+
+	local SSH_HOST="$1"
+	local VG_NAME
+	local LV_NAME
+	local SNAPSHOTS_DIR
+	
+	while [ "$#" -ge 1 ]; do
+		case "$1" in
+			--volume-group=*)
+				VG_NAME=`echo $1 | sed 's/[-a-zA-Z0-9]*=//'`
+				shift
+				;;
+			--logical-volume=*)
+				LV_NAME=`echo $1 | sed 's/[-a-zA-Z0-9]*=//'`
+				shift
+				;;
+			--snapshots-dir=*)
+				SNAPSHOTS_DIR=`echo $1 | sed 's/[-a-zA-Z0-9]*=//'`
+				shift
+				;;
+			*)
+				shift
+				;;
+		esac
+	done
+
+
+	local SNAPSHOTS=
+	SNAPSHOTS=`_list_remote_snapshots "$SSH_HOST" "$VG_NAME" "$LV_NAME"`
+	if [ $? -ne 0 ]; then
+		echo "Cannot obtain list of snapshots" >&2
+		return 1
+	fi
+	
+	if [ ! -d "${SNAPSHOTS_DIR}" ]; then
+		echo "Snapshots directory ${SNAPSHOTS_DIR} is not exist. Create it..."
+		mkdir -p "${SNAPSHOTS_DIR}"
+		if [ $? -ne 0 ]; then
+			echo "Cannot create snapshots directory" >&2
+			return 12
+		fi
+	fi
+
+	local AT_LEAST_ONE_SNAPSHOT_WAS_DOWNLOADED=N
+	local DEV=
+	for DEV in $SNAPSHOTS; do
+		local SNAPSHOT_DATE=`basename "$DEV" | grep -oE '[0-9]{14}$'`
+		if [ -z "${SNAPSHOT_DATE}" ]; then
+			echo "Cannot get snapshot date for $DEV" >&2
+			return 242
+		fi
+		
+		local IMG_FILE="${SNAPSHOTS_DIR}/${SNAPSHOT_DATE}.img"
+
+		echo "Imaging remote host dev ${SSH_HOST}:${DEV} to local file ${IMG_FILE}.tmp"
+
+		while true; do sleep 300; echo " ... $(ls -lh ${IMG_FILE}.tmp | awk '{ print $5 }')"; done 2> /dev/null &
+		PID=$!
+
+		local SSH_COPY_ERR_CODE=
+		echo
+		ssh -o "BatchMode yes" "${SSH_HOST}" "dd if=${DEV} | gzip -c -1" | gunzip -c | dd of="${IMG_FILE}.tmp"
+		SSH_COPY_ERR_CODE=$?
+		echo
+		kill $PID 2> /dev/null
+		wait $PID 2> /dev/null
+		if [ $SSH_COPY_ERR_CODE -ne 0 ]; then
+			echo "Cannot copy snapshot: Error code $SSH_COPY_ERR_CODE" >&2
+			return 2
+		fi
+		if [ ! -r "${IMG_FILE}.tmp" ]; then
+			echo "Snapshot was not copied." >&2
+			return 2
+		fi
+
+		sleep 3
+
+		echo "Calculate remote snapshot $DEV SHA sum"
+		REMOTE_SNAP_SHA=`ssh -o "BatchMode yes" "${SSH_HOST}" "sha512sum -b $DEV" | awk '{ print $1 }'`
+		echo " ... remote snapshot $DEV SHA sum: $REMOTE_SNAP_SHA"
+
+		echo "Calculate SHA sum of retrived snaphot ${IMG_FILE}.tmp"
+		IMG_FILE_SHA=`__get_file_sum "${IMG_FILE}.tmp" --do-not-save-sum`
+		echo " ... snapshot copy ${IMG_FILE}.tmp SHA sum: $IMG_FILE_SHA"
+
+		if [ "$REMOTE_SNAP_SHA" != "$IMG_FILE_SHA" ]; then
+			echo "Retrived snapshot checksum not equals" >&2
+			return 3
+		fi
+
+		echo "Snapshot copy has correct SHA sum $IMG_FILE_SHA"
+
+		mv "${IMG_FILE}.tmp" "${IMG_FILE}"
+		if [ $? -ne 0 ]; then
+			echo "Cannot move snapshot ${IMG_FILE}.tmp to ${IMG_FILE}" >&2
+			return 4
+		fi
+		echo "Snapshot moved to ${IMG_FILE}"
+		echo -n "$IMG_FILE_SHA" > "${IMG_FILE}.sum"
+
+		echo "Delete remote snapshot $DEV"
+		ssh -o "BatchMode yes" "${SSH_HOST}" "sudo /sbin/lvremove -f $DEV"
+		if [ $? -ne 0 ]; then
+			echo "Cannot remove remote snapshot $DEV" >&2
+			echo "Check /etc/sudoers for allow to use /sbin/lvremove for user $USER" >&2
+			return 5
+		fi
+
+		AT_LEAST_ONE_SNAPSHOT_WAS_DOWNLOADED=Y
+		echo
+	done
+	
+	if [ "${AT_LEAST_ONE_SNAPSHOT_WAS_DOWNLOADED}" != "Y" ]; then
+		echo "No snapshots" >&2
+		return 68
+	fi
+
+	return 0
+}
+
+
+function _update_delta {
+	if [ $# -eq 0 ]; then
+		echo "Usage:
+    $0 --snapshots-dir=SnapshotsDirectory --max-history-months=MaxHisoryDays --deltas-dir=DeltasDirectory" >&2
+		return 255
+	fi
+	
+	local SNAPSHOTS_DIR
+	local MAX_HISTORY_MONTHS
+	local DELTAS_DIR
+
+	while [ "$#" -ge 1 ]; do
+		case "$1" in
+			--snapshots-dir=*)
+				SNAPSHOTS_DIR=`echo $1 | sed 's/[-a-zA-Z0-9]*=//'`
+				shift
+				;;
+			--deltas-dir=*)
+				DELTAS_DIR=`echo $1 | sed 's/[-a-zA-Z0-9]*=//'`
+				shift
+				;;
+			--max-history-months=*)
+				MAX_HISTORY_MONTHS=`echo $1 | sed 's/[-a-zA-Z0-9]*=//'`
+				shift
+				;;
+		esac
+	done
+
+	if [ ! -d "${SNAPSHOTS_DIR}" ]; then
+		echo "Bad snapshot directory ${SNAPSHOTS_DIR}" >&2
+		return 254
+	fi
+
+	if [[ ! "${MAX_HISTORY_MONTHS}" =~ ^[0-9]+$ ]] || [ "$MAX_HISTORY_MONTHS" -lt 1 -o "$MAX_HISTORY_MONTHS" -gt 36 ]; then
+		echo "Bad max history months value. It should be in range 1..36" >&2
+		return 254
+	fi
+
+	if [ ! -d "$DELTAS_DIR" ]; then
+		echo "Deltas directory ${DELTAS_DIR} is not exist. Make it." >&2
+		mkdir "$DELTAS_DIR"
+		if [ $? -ne 0 ]; then
+			echo "Cannot create deltas directory ${DELTAS_DIR}" >&2
+			return 51
+		fi
+	fi
+
+
+	local SNAPSHOTS=(`find "${SNAPSHOTS_DIR}" -name "*.img" -maxdepth 1 -type f -printf "%f\n" 2>/dev/null | grep -E "^[0-9]{14}\.img$"  | sort -t - -k 3 -g`)
+	local SNAPSHOT_COUNT=${#SNAPSHOTS[@]}
+
+	if [ "$SNAPSHOT_COUNT" -eq 0 ]; then
+		echo "Any snapshots were not found." >&2
+		return 0
+	fi
+
+	for (( index=0; index<$SNAPSHOT_COUNT; index++ )); do
+		echo "	${SNAPSHOTS[$index]}"
+	done
+
+	local INITAL_SNAPSHOT_FILE
+	local DELTA_IMG_FILES=(`find "${DELTAS_DIR}" -name "*.img" -maxdepth 1 -type f -printf "%f\n" 2>/dev/null | grep -E "^[0-9]{14}\.img$"`)
+	if [ "${#DELTA_IMG_FILES[@]}" -gt 1 ]; then
+		echo "Deltas folder ${DELTAS_DIR} is corrupt. Found more than one *.img file. Fix it." >&2
+		return 233
+	elif [ "${#DELTA_IMG_FILES[@]}" -eq 1 ]; then
+		INITAL_SNAPSHOT_FILE="${DELTAS_DIR}/${DELTA_IMG_FILES[0]}"
+	else
+		echo "Inital snapshot was not found in deltas directory ${DELTAS_DIR}. Try to move inital snapshot."
+		if [ "$SNAPSHOT_COUNT" -gt 0 ]; then
+			mv "${SNAPSHOTS_DIR}/${SNAPSHOTS[0]}" "${DELTAS_DIR}/${SNAPSHOTS[0]}"
+			if [ $? -ne 0 ]; then
+				echo "Cannot move inital snapshot from ${SNAPSHOTS_DIR}/${SNAPSHOTS[0]} to ${DELTAS_DIR}/${SNAPSHOTS[0]}" >&2
+				return 251
+			fi
+			mv "${SNAPSHOTS_DIR}/${SNAPSHOTS[0]}.sum" "${DELTAS_DIR}/${SNAPSHOTS[0]}.sum"
+
+			INITAL_SNAPSHOT_FILE="${DELTAS_DIR}/${SNAPSHOTS[0]}"
+
+			unset SNAPSHOTS[0]
+			SNAPSHOTS=(${SNAPSHOTS[@]})
+			SNAPSHOT_COUNT=${#SNAPSHOTS[@]}
+		fi
+	fi
+
+	echo "Integrity checking..."
+	echo "	Inital snapshot     $INITAL_SNAPSHOT_FILE"
+
+	local DELTAS=(`find "${DELTAS_DIR}" -name "*.xdelta" -maxdepth 1 -type f -printf "%f\n" 2>/dev/null | grep -E "^[0-9]{14}_[0-9]{14}\.xdelta$"  | sort -t - -k 3 -g`)
+	local DELTA_COUNT=${#DELTAS[@]}
+	echo "Found $DELTA_COUNT delta(s)"
+
+	if [ "$DELTA_COUNT" -gt 0 ]; then
+		local CHECKED_SNAPSHOT=`echo "${INITAL_SNAPSHOT_FILE}" | grep -oE "[0-9]{14}"`
+		for (( index=0; index<${DELTA_COUNT}; index++ )); do
+			echo -n "	Checking ${DELTAS[$index]}..."
+	
+			local DELTA_FROM=`echo "${DELTAS[$index]}" | head -c 14`
+			local DELTA_TO=`echo "${DELTAS[$index]}" | head -c 29 | tail -c 14`
+		
+			if [ "${CHECKED_SNAPSHOT}" != "${DELTA_FROM}" ]; then
+				echo
+				echo "Deltas corrupt. Bad delta from. Expected ${CHECKED_SNAPSHOT} but have ${DELTA_FROM}" >&2
+				return 2
+			fi
+			
+			echo " OK"
+		
+			CHECKED_SNAPSHOT="${DELTA_TO}"
+		done
+		local IS_VALID_LAST_DELTA=false
+		for (( index=1; index<${SNAPSHOT_COUNT}; index++ )); do
+			local CHECKED_SNAPSHOT="${SNAPSHOTS[$index]}"
+			if [ "${CHECKED_SNAPSHOT}" == "${CHECKED_SNAPSHOT}" ]; then
+				IS_VALID_LAST_DELTA=true
+				break
+			fi
+		done		
+		if [ ! "${IS_VALID_LAST_DELTA=}" ]; then
+			echo "Deltas corrupt. Invalid delta for last snapshot. ${CHECKED_SNAPSHOT}.img" >&2
+			return 2
+		fi
+	
+		echo "All of deltas exist."
+	fi
+
+	if [ "${SNAPSHOT_COUNT}" -gt 0 ]; then
+		echo "Making deltas..."
+		local SNAPSHOT_START_INDEX
+		local SNAPSHOT_LAST_INDEX
+		local PREV_SNAPSHOT_FILE
+		
+		let "SNAPSHOT_LAST_INDEX=${SNAPSHOT_COUNT}-1"
+
+		if [ "${DELTA_COUNT}" -eq 0 ]; then
+			echo "This a first delta, so start from inital snapshot."
+			SNAPSHOT_START_INDEX=0
+			PREV_SNAPSHOT_FILE="${INITAL_SNAPSHOT_FILE}"
+		else
+			local LATEST_DELTA_DATE=`echo "${DELTAS[$DELTA_COUNT-1]}" | head -c 29 | tail -c 14`
+
+			SNAPSHOT_START_INDEX=0
+			PREV_SNAPSHOT_FILE="${SNAPSHOTS_DIR}/${LATEST_DELTA_DATE}.img"
+
+			# Snapshots dir can contains older snapshot, so try to increment index to find first new snapshot
+			while [ "$SNAPSHOT_START_INDEX" -lt "${SNAPSHOT_COUNT}" -a "${SNAPSHOTS[$SNAPSHOT_START_INDEX]}" != "${LATEST_DELTA_DATE}.img" ]; do
+				let "SNAPSHOT_START_INDEX=$SNAPSHOT_START_INDEX+1"
+			done
+			if [ "${SNAPSHOT_START_INDEX}" -eq "${SNAPSHOT_COUNT}" ]; then
+				echo "Previous snapshot ${PREV_SNAPSHOT_FILE} was not found" >&2
+				return 55
+			fi
+			let "SNAPSHOT_START_INDEX=$SNAPSHOT_START_INDEX+1"
+		fi
+
+		if [ "${SNAPSHOT_START_INDEX}" -lt "${SNAPSHOT_COUNT}" ]; then
+			echo "	Previous snapshot	${PREV_SNAPSHOT_FILE}"
+#			echo "		SNAPSHOT_START_INDEX=$SNAPSHOT_START_INDEX"
+#			echo "		SNAPSHOT_COUNT=$SNAPSHOT_COUNT"
+
+			for (( index=${SNAPSHOT_START_INDEX}; index<${SNAPSHOT_COUNT}; index++ )); do
+				local NEXT_SNAPSHOT_FILE="${SNAPSHOTS_DIR}/${SNAPSHOTS[$index]}"
+				local DELTA_FROM=`echo "${PREV_SNAPSHOT_FILE}" | grep -oE "[0-9]{14}"`
+				local DELTA_TO=`echo "${NEXT_SNAPSHOT_FILE}" | grep -oE "[0-9]{14}"`
+
+				local PREV_SNAPSHOT_SUM
+				PREV_SNAPSHOT_SUM=`__get_file_sum "${PREV_SNAPSHOT_FILE}"`
+				if [ $? -ne 0 -o -z "${PREV_SNAPSHOT_SUM}" ]; then
+					echo "Cannot get hash sum of prev snapshot" >&2
+					return 5
+				fi
+				echo "Prev snapshot hash sum                   ... ${PREV_SNAPSHOT_SUM}"
+
+				local NEXT_SNAPSHOT_SUM
+				NEXT_SNAPSHOT_SUM=`__get_file_sum "${NEXT_SNAPSHOT_FILE}"`
+				if [ $? -ne 0 -o -z "${NEXT_SNAPSHOT_SUM}" ]; then
+					echo "Cannot get hash sum of next snapshot" >&2
+					return 5
+				fi
+				echo "Next snapshot hash sum                   ... ${NEXT_SNAPSHOT_SUM}"
+				
+				if [ "$DELTA_FROM" -gt "$DELTA_TO" ]; then
+					echo "Bug detected! DeltaFrom bigger that DeltaTo" >&2
+					return 87
+				elif [ "$DELTA_FROM" -ge "$DELTA_TO" ]; then
+					echo "Prev snapshot name same as next snapshot name. Verify hash sum."
+					if [ "$PREV_SNAPSHOT_SUM" != "$NEXT_SNAPSHOT_SUM" ]; then
+						echo "Snapshot names equal, but hash sums is NOT equal" >&2
+						return 46
+					fi
+					echo "Snapshots sum is equal. Skip Delta file makging."
+				else				
+					local DELTA_FILE="${DELTAS_DIR}/${DELTA_FROM}_${DELTA_TO}.xdelta"
+
+					if [ -r "${DELTA_FILE}" ]; then
+						echo "Bug detected. Delta ${DELTA_FILE} already exists." >&2
+						return 176
+					fi
+
+					echo "Make delta ${DELTA_FILE}"
+					/usr/bin/xdelta3 -e -s "${PREV_SNAPSHOT_FILE}" "${NEXT_SNAPSHOT_FILE}" "${DELTA_FILE}.tmp"
+					if [ $? -ne 0 ]; then
+					echo "Cannot create delta file ${DELTA_FILE}.tmp" >&2
+						return 3
+					fi
+
+					local VERIFY_SUM
+					VERIFY_SUM=`xdelta3 -c -d -s "${PREV_SNAPSHOT_FILE}" "${DELTA_FILE}.tmp"  | sha512sum | awk '{ print $1 }'`
+					if [ $? -ne 0 -o -z "${VERIFY_SUM}" ]; then
+						echo
+						echo "Cannot calculate hash sum of restored snapshot" >&2
+						return 5
+					fi
+					echo "Calculate hash sum of restored snapshot  ... ${VERIFY_SUM}"
+					if [ "${VERIFY_SUM}" != "${NEXT_SNAPSHOT_SUM}" ]; then
+						echo "ERROR: Verify check sum is not valid" >&2
+						return 6
+					fi
+
+					mv "${DELTA_FILE}.tmp" "${DELTA_FILE}"
+					if [ $? -ne 0 ]; then
+						echo "Cannot rename delta file  ${DELTA_FILE}.tmp -> ${DELTA_FILE}" >&2
+						return 7
+					fi
+
+					echo "Calculting hash sum of delta ${DELTA_FILE}"
+					local DELTA_SUM
+					DELTA_SUM=`__get_file_sum "${DELTA_FILE}"`
+					if [ $? -ne 0 -o -z "${DELTA_SUM}" ]; then
+						echo "Cannot calculate hash sum of next snapshot ${DELTA_FILE}" >&2
+						return 4
+					fi
+			    		echo " ... ${DELTA_SUM}"
+					echo -n "$NEXT_SNAPSHOT_SUM" > "${DELTAS_DIR}/${SNAPSHOTS[$index]}.sum"
+				fi
+
+				# Remove prev snapshot
+				if  [ "${PREV_SNAPSHOT_FILE}" != "${INITAL_SNAPSHOT_FILE}" ]; then
+					echo "Remove prev snapshot ${PREV_SNAPSHOT_FILE}"
+					rm "${PREV_SNAPSHOT_FILE}"
+					if [ $? -ne 0 ]; then
+						echo "Cannot remove prev snapshot" >&2
+						return 8
+					fi
+					echo "Remove prev snapshot ${PREV_SNAPSHOT_FILE}.sum"
+					rm "${PREV_SNAPSHOT_FILE}.sum"
+				else
+					echo "This is an inital snapshot. Skip remove step."
+				fi
+
+				PREV_SNAPSHOT_FILE="${NEXT_SNAPSHOT_FILE}"
+				echo
+			done
+
+			echo
+			echo "You can restore snapshot ${NEXT_SNAPSHOT} using following command:"
+			echo "cd ~ && \\"
+			echo "mkdir tmp && \\"
+			echo "cd tmp && \\"
+			echo "cp \"${DELTAS_DIR}\"/* . && \\"
+			DELTAS=(`find "${DELTAS_DIR}" -name "*.xdelta" -maxdepth 1 -type f -printf "%f\n" 2>/dev/null | grep -E "^[0-9]{14}_[0-9]{14}\.xdelta$"  | sort -t - -k 3 -g`)
+			local PREV=`basename ${INITAL_SNAPSHOT_FILE}`
+			for (( index=0; index<${#DELTAS[@]}; index++ )); do
+				local DELTA_FROM=`echo "${DELTAS[$index]}" | head -c 14`
+				local DELTA_TO=`echo "${DELTAS[$index]}" | head -c 29 | tail -c 14`
+				echo -n "xdelta3 -d -s \"${PREV}\" \"${DELTAS[$index]}\" \"${DELTA_TO}.img\" && "
+				if [ $index -gt 0 ]; then
+					echo "rm \"${PREV}\" && \\"
+				else
+					echo "\\"
+				fi
+				PREV="${DELTA_TO}.img"
+			done
+			echo "echo \"That's all\""
+			echo 
+		fi
+	fi
+
+	echo "Cleanup by history..."
+	DELTAS=
+	DELTAS=(`find "${DELTAS_DIR}" -name "*.xdelta" -maxdepth 1 -type f -printf "%f\n" 2>/dev/null | grep -E "^[0-9]{14}_[0-9]{14}\.xdelta$"  | sort -t - -k 3 -g`)
+	DELTA_COUNT=${#DELTAS[@]}
+	if [ "$DELTA_COUNT" -gt 1 ]; then
+		MINIMAL_DATE=`date -d "${MAX_HISTORY_MONTHS} months ago" "+%Y%m00000000"`
+		echo "Remove all deltas early than ${MINIMAL_DATE}"
+		local CLEAN_DELTA_COUNT
+		let "CLEAN_DELTA_COUNT=${DELTA_COUNT}-1"
+		for (( index=0; index<${CLEAN_DELTA_COUNT}; index++ )); do
+			local DELTA_FROM=`echo "${DELTAS[$index]}" | head -c 14`
+			local DELTA_TO=`echo "${DELTAS[$index]}" | head -c 29 | tail -c 14`
+			if [ "${DELTA_FROM}" -lt "$MINIMAL_DATE" ]; then
+				echo "Restore snapshot ${DELTA_TO}.img"
+				/usr/bin/xdelta3 -d -s "${DELTAS_DIR}/${DELTA_FROM}.img" "${DELTAS_DIR}/${DELTAS[$index]}" "${DELTAS_DIR}/${DELTA_TO}.img.tmp"
+				if [ $? -ne 0 ]; then
+					echo "Cannot restore snapshot ${DELTA_TO}"
+					return 65
+				fi
+
+				local SNAPSHOT_SUM=
+				SNAPSHOT_SUM=`__get_file_sum "${DELTAS_DIR}/${DELTA_TO}.img.tmp" --do-not-save-sum`
+				if [ -z "${SNAPSHOT_SUM}" ]; then
+					echo
+					echo "Cannot calculate hash sum of a snapshot ${SCRIPT_TEMP}/${DELTA_TO}.img.tmp" >&2
+					return 44
+				fi
+				echo "Calculate hash sum of restored snapshot: ${SNAPSHOT_SUM}"
+				
+				local VERIFY_SUM=`cat "${DELTAS_DIR}/${DELTA_TO}.img.sum"`
+				if [ -z "${VERIFY_SUM}" ]; then
+					echo "Cannot read hash sum of a snapshot ${DELTAS_DIR}/${DELTA_TO}.img.sum" >&2
+					return 45
+				fi
+				
+				if [ "${SNAPSHOT_SUM}" == "${VERIFY_SUM}" ]; then
+					echo "Hash sum is correct"
+				else
+					echo "Bad hash sum of the snapshot ${DELTAS_DIR}/${DELTA_TO}.img.tmp" >&2
+					return 127
+				fi
+
+				mv "${DELTAS_DIR}/${DELTA_FROM}.img" "${DELTAS_DIR}/${DELTA_FROM}.img.bak"
+				if [ $? -ne 0 ]; then
+					echo "Cannot rename file ${DELTA_FROM}.img ${DELTA_FROM}.img.bak" >&2
+					return 38
+				fi
+
+				mv "${DELTAS_DIR}/${DELTA_TO}.img.tmp" "${DELTAS_DIR}/${DELTA_TO}.img"
+				if [ $? -ne 0 ]; then
+					echo "Cannot rename file ${DELTA_TO}.img.tmp ${DELTA_TO}.img" >&2
+					return 39
+				fi
+
+				echo "Remove previous snapshot ${DELTAS_DIR}/${DELTA_FROM}.img.bak"
+				rm "${DELTAS_DIR}/${DELTA_FROM}.img.bak"
+				if [ $? -ne 0 ]; then
+					echo "Cannot remove previous snapshot ${DELTAS_DIR}/${DELTA_FROM}.img.bak"
+					return 38
+				fi
+				
+				echo "Remove old delta ${DELTAS[$index]}"
+				rm "${DELTAS_DIR}/${DELTAS[$index]}"
+				if [ $? -ne 0 ]; then
+					echo "Cannot remove delta file ${DELTAS_DIR}/${DELTAS[$index]}"
+					return 37
+				fi
+				[ -f "${DELTAS_DIR}/${DELTAS[$index]}.sum" ] && rm -f "${DELTAS_DIR}/${DELTAS[$index]}.sum"
+
+				if [ -r "${DELTAS_DIR}/${DELTA_FROM}.img.sum" ]; then
+					echo "Remove old hash sum ${DELTAS_DIR}/${DELTA_FROM}.img.sum"
+					rm "${DELTAS_DIR}/${DELTA_FROM}.img.sum"
+					if [ $? -ne 0 ]; then
+						echo "Cannot remove delta file ${DELTAS_DIR}/${DELTA_FROM}.img.sum"
+						return 37
+					fi
+				fi
+				echo
+			fi
+		done
+	else
+		echo "Nothing delta to remove."
+	fi
+	
+	return 0
+}
+
+
+# Run
+case ${SCRIPT_ACTION} in
+zxbackup-create-local-snapshot)
+	if ! _create_local_snapshot "$@"; then
+		echo "Error!" >&2
+		exit 1
+	fi
+	exit 0
+	;;
+zxbackup-create-remote-snapshot)
+	if ! _create_remote_snapshot "$@"; then
+		echo "Error!" >&2
+		exit 1
+	fi
+	exit 0
+	;;
+zxbackup-download-remote-snapshots)
+	if ! _download_remote_snapshots "$@"; then
+		echo "Error!" >&2
+		exit 1
+	fi
+	exit 0
+	;;
+zxbackup-update-delta)
+	if ! _update_delta "$@"; then
+		echo "Error!" >&2
+		exit 1
+	fi
+	exit 0
+	;;
+*)
+	echo "Unknown action: ${SCRIPT_ACTION}"
+	;;
+esac
+
+echo "Action was not selected."
+exit 1

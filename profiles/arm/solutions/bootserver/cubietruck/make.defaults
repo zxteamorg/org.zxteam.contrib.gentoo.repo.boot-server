@@ -1,0 +1,3 @@
+USE="${USE} -X -alsa -cups -fontconfig -ipv6 -java ldap"
+
+MAKEOPTS="-j2"

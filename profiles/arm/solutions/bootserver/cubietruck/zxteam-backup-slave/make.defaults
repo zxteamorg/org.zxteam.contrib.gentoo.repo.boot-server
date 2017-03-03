@@ -1,0 +1,3 @@
+USE="${USE} X sqlite"
+
+MAKEOPTS="-j2"

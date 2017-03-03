@@ -1,0 +1,8 @@
+# imagemount configuration file for /etc/init.d/imagemount
+
+#IMAGE_FILES_FIND_PATTERNS="/img/disk-*.iso"
+#ACTIVATE_VOLUMES="vg0 vg1"
+
+#MOUNT_POINTS="/dev/vg0/vol0 /dev/vg1/vol1"
+
+#LAZY_MOUNT_POINTS="/dev/vg0/crypto-vol0 /dev/vg1/crypto-vol1"
